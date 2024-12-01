@@ -119,6 +119,51 @@ const MoveFileArgsSchema = z.object({
   destination: z.string(),
 });
 
+const UpdateOperationSchema = z.object({
+  startPosition: z.number(),
+  endPosition: z.number().optional(),
+  operation: z.enum(['replace', 'insert', 'delete']),
+  newContent: z.string().optional()  // Make newContent optional
+}).refine((data) => {
+  if (data.operation === 'delete') {
+    return data.endPosition !== undefined; // Require endPosition for delete
+  }
+  if (data.operation === 'replace') {
+    return data.endPosition !== undefined && data.newContent !== undefined; // Require both for replace
+  }
+  if (data.operation === 'insert') {
+    return data.newContent !== undefined; // Require newContent for insert
+  }
+  return false;
+}, {
+  message: "Invalid operation parameters"
+});
+
+const LineOperationSchema = z.object({
+  type: z.enum(['replaceLines', 'insertLines', 'deleteLines']),
+  startLine: z.number().positive(),
+  endLine: z.number().positive().optional(),
+  newContent: z.string().optional(),
+}).refine((data) => {
+  if (data.type === 'deleteLines') {
+    return data.endLine !== undefined;
+  }
+  if (data.type === 'replaceLines') {
+    return data.endLine !== undefined && data.newContent !== undefined;
+  }
+  if (data.type === 'insertLines') {
+    return data.newContent !== undefined;
+  }
+  return false;
+}, {
+  message: "Invalid line operation parameters"
+});
+
+const UpdateFileArgsSchema = z.object({
+  path: z.string(),
+  operations: z.array(UpdateOperationSchema),
+});
+
 const SearchFilesArgsSchema = z.object({
   path: z.string(),
   pattern: z.string(),
@@ -139,6 +184,187 @@ interface FileInfo {
   isDirectory: boolean;
   isFile: boolean;
   permissions: string;
+}
+
+interface Position {
+  line: number;
+  column: number;
+}
+
+interface FilePosition {
+  offset: number;  // Absolute position in file
+  line: number;    // 1-based line number
+  column: number;  // 1-based column number
+}
+
+interface LineRange {
+  startLine: number;
+  endLine?: number;
+}
+
+interface LinePosition {
+  line: number;
+  column: number;
+}
+
+// Add these utility functions
+function getLineRange(content: string, startPos: number, endPos?: number): LineRange {
+  const lines = content.split('\n');
+  let currentPos = 0;
+  let startLine = 0;
+  let endLine = 0;
+
+  // Find start line
+  for (let i = 0; i < lines.length; i++) {
+    if (currentPos + lines[i].length >= startPos) {
+      startLine = i;
+      break;
+    }
+    currentPos += lines[i].length + 1; // +1 for newline
+  }
+
+  // Find end line if provided
+  if (endPos !== undefined) {
+    currentPos = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (currentPos + lines[i].length >= endPos) {
+        endLine = i;
+        break;
+      }
+      currentPos += lines[i].length + 1;
+    }
+    return { startLine, endLine };
+  }
+
+  return { startLine };
+}
+
+// Add safety checks for code structure
+function validateCodeStructure(content: string): void {
+  // Check balanced brackets/braces
+  const pairs = { '{': '}', '(': ')', '[': ']' };
+  const stack: string[] = [];
+
+  for (const char of content) {
+    if ('{(['.includes(char)) {
+      stack.push(char);
+    } else if ('})]'.includes(char)) {
+      const last = stack.pop();
+      const expected = Object.entries(pairs).find(([_, close]) => close === char)?.[0];
+      if (last !== expected) {
+        throw new Error(`Unbalanced brackets: expected ${expected}, got ${char}`);
+      }
+    }
+  }
+
+  if (stack.length > 0) {
+    throw new Error(`Unclosed brackets: ${stack.join(', ')}`);
+  }
+}
+
+// Add line-based operations
+interface LineOperation {
+  type: 'replaceLines' | 'insertLines' | 'deleteLines';
+  startLine: number;
+  endLine?: number;
+  newContent?: string;
+}
+
+async function performLineBasedUpdate(filePath: string, operation: LineOperation): Promise<string> {
+  const { content, lines } = await getFilePositions(filePath);
+  const modifiedLines = [...lines];
+
+  switch (operation.type) {
+    case 'replaceLines':
+      if (!operation.newContent || operation.endLine === undefined) {
+        throw new Error('Replace operation requires newContent and endLine');
+      }
+      modifiedLines.splice(
+        operation.startLine - 1,
+        operation.endLine - operation.startLine + 1,
+        ...operation.newContent.split('\n')
+      );
+      break;
+
+    case 'insertLines':
+      if (!operation.newContent) {
+        throw new Error('Insert operation requires newContent');
+      }
+      modifiedLines.splice(
+        operation.startLine - 1,
+        0,
+        ...operation.newContent.split('\n')
+      );
+      break;
+
+    case 'deleteLines':
+      if (operation.endLine === undefined) {
+        throw new Error('Delete operation requires endLine');
+      }
+      modifiedLines.splice(
+        operation.startLine - 1,
+        operation.endLine - operation.startLine + 1
+      );
+      break;
+  }
+
+  return modifiedLines.join('\n');
+}
+
+// Utility functions for position handling
+async function getFilePositions(filePath: string): Promise<{
+  content: string;
+  lines: string[];
+  lineStarts: number[];  // Index where each line starts
+}> {
+  const content = await fs.readFile(filePath, 'utf-8');
+  const lines = content.split('\n');
+  
+  // Calculate line start positions
+  const lineStarts = [0];  // First line starts at 0
+  let position = 0;
+  for (let i = 0; i < lines.length - 1; i++) {
+    position += lines[i].length + 1; // +1 for \n
+    lineStarts.push(position);
+  }
+  
+  return { content, lines, lineStarts };
+}
+
+function validatePosition(position: number, fileLength: number): void {
+  if (position < 0 || position > fileLength) {
+    throw new Error(`Position ${position} out of bounds (0-${fileLength})`);
+  }
+}
+
+function validatePositions(startPosition: number, endPosition: number | undefined, fileLength: number): void {
+  validatePosition(startPosition, fileLength);
+  if (endPosition !== undefined) {
+    validatePosition(endPosition, fileLength);
+    if (endPosition < startPosition) {
+      throw new Error(`End position ${endPosition} cannot be before start position ${startPosition}`);
+    }
+  }
+}
+
+// Convert line/column to absolute position
+function getOffsetFromLineColumn(lineStarts: number[], line: number, column: number): number {
+  if (line < 1 || line > lineStarts.length) {
+    throw new Error(`Invalid line number: ${line}`);
+  }
+  const lineStart = lineStarts[line - 1];
+  return lineStart + column - 1;
+}
+
+// Convert absolute position to line/column
+function getLineColumnFromOffset(lineStarts: number[], offset: number): Position {
+  const line = lineStarts.findIndex((start, index) => {
+    const nextStart = index < lineStarts.length - 1 ? lineStarts[index + 1] : Infinity;
+    return offset >= start && offset < nextStart;
+  }) + 1;
+  
+  const column = offset - lineStarts[line - 1] + 1;
+  return { line, column };
 }
 
 // Server setup
@@ -200,6 +426,38 @@ async function searchFiles(
 
   await search(rootPath);
   return results;
+}
+
+async function performFileUpdate(filePath: string, operations: z.infer<typeof UpdateOperationSchema>[]): Promise<string> {
+  const { content } = await getFilePositions(filePath);
+  let result = content;
+  const fileLength = content.length;
+
+  // Sort operations by startPosition in descending order
+  const sortedOps = [...operations].sort((a, b) => (b.startPosition ?? 0) - (a.startPosition ?? 0));
+
+  for (const op of sortedOps) {
+    const { startPosition, endPosition, operation, newContent } = op;
+    validatePositions(startPosition, endPosition, fileLength);
+
+    try {
+      const newResult = result.substring(0, startPosition) + 
+        (operation === 'delete' ? '' : newContent) + 
+        result.substring(operation === 'insert' ? startPosition : (endPosition ?? startPosition));
+
+      // Validate code structure isn't broken
+      if (filePath.endsWith('.ts') || filePath.endsWith('.js')) {
+        validateCodeStructure(newResult);
+      }
+
+      result = newResult;
+    } catch (error) {
+      const pos = getLineColumnFromOffset(result.split('\n'), startPosition);
+      throw new Error(`Operation failed at line ${pos.line}, column ${pos.column}: ${error.message}`);
+    }
+  }
+
+  return result;
 }
 
 // Tool handlers
@@ -269,6 +527,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           "matching items. Great for finding files when you don't know their exact location. " +
           "Only searches within allowed directories.",
         inputSchema: zodToJsonSchema(SearchFilesArgsSchema) as ToolInput,
+      },
+      {
+        name: "modify_file",
+        description:
+          "Update specific portions of a file with new content. Supports inserting, " +
+          "replacing, or deleting content at specific positions. Each operation specifies " +
+          "the position and content to modify. Operations are applied in order from last " +
+          "to first position to maintain integrity. Only works within allowed directories.",
+        inputSchema: zodToJsonSchema(UpdateFileArgsSchema) as ToolInput,
       },
       {
         name: "get_file_info",
@@ -395,6 +662,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const results = await searchFiles(validPath, parsed.data.pattern);
         return {
           content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No matches found" }],
+        };
+      }
+
+      case "modify_file": {
+        const parsed = UpdateFileArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for modify_file: ${parsed.error}`);
+        }
+        const validPath = await validatePath(parsed.data.path);
+        const newContent = await performFileUpdate(validPath, parsed.data.operations);
+        await fs.writeFile(validPath, newContent, "utf-8");
+        return {
+          content: [{ type: "text", text: `Successfully updated ${parsed.data.path}` }],
         };
       }
 
