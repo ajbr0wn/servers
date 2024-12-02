@@ -119,7 +119,7 @@ const MoveFileArgsSchema = z.object({
   destination: z.string(),
 });
 
-const UpdateOperationSchema = z.object({
+const CharOperationSchema = z.object({
   startPosition: z.number(),
   endPosition: z.number().optional(),
   operation: z.enum(['replace', 'insert', 'delete']),
@@ -159,9 +159,14 @@ const LineOperationSchema = z.object({
   message: "Invalid line operation parameters"
 });
 
-const UpdateFileArgsSchema = z.object({
+const ModifyLinesArgsSchema = z.object({
   path: z.string(),
-  operations: z.array(UpdateOperationSchema),
+  operations: z.array(LineOperationSchema)
+});
+
+const ModifyCharsArgsSchema = z.object({
+  path: z.string(),
+  operations: z.array(CharOperationSchema),
 });
 
 const SearchFilesArgsSchema = z.object({
@@ -191,20 +196,13 @@ interface Position {
   column: number;
 }
 
-interface FilePosition {
-  offset: number;  // Absolute position in file
-  line: number;    // 1-based line number
-  column: number;  // 1-based column number
+interface FilePosition extends Position {
+  offset: number;
 }
 
 interface LineRange {
   startLine: number;
   endLine?: number;
-}
-
-interface LinePosition {
-  line: number;
-  column: number;
 }
 
 // Add these utility functions
@@ -263,52 +261,62 @@ function validateCodeStructure(content: string): void {
 }
 
 // Add line-based operations
-interface LineOperation {
-  type: 'replaceLines' | 'insertLines' | 'deleteLines';
-  startLine: number;
-  endLine?: number;
-  newContent?: string;
-}
+type LineOperation = z.infer<typeof LineOperationSchema>;
 
-async function performLineBasedUpdate(filePath: string, operation: LineOperation): Promise<string> {
+async function performLineBasedUpdate(filePath: string, operations: LineOperation[]): Promise<string> {
   const { content, lines } = await getFilePositions(filePath);
   const modifiedLines = [...lines];
+  
+  // Apply all operations without validation
+  for (const operation of operations) {
+    switch (operation.type) {
+      case 'replaceLines':
+        if (!operation.newContent || operation.endLine === undefined) {
+          throw new Error('Replace operation requires newContent and endLine');
+        }
+        modifiedLines.splice(
+          operation.startLine - 1,
+          operation.endLine - operation.startLine + 1,
+          ...operation.newContent.split('\n')
+        );
+        break;
 
-  switch (operation.type) {
-    case 'replaceLines':
-      if (!operation.newContent || operation.endLine === undefined) {
-        throw new Error('Replace operation requires newContent and endLine');
-      }
-      modifiedLines.splice(
-        operation.startLine - 1,
-        operation.endLine - operation.startLine + 1,
-        ...operation.newContent.split('\n')
-      );
-      break;
+      case 'insertLines':
+        if (!operation.newContent) {
+          throw new Error('Insert operation requires newContent');
+        }
+        modifiedLines.splice(
+          operation.startLine - 1,
+          0,
+          ...operation.newContent.split('\n')
+        );
+        break;
 
-    case 'insertLines':
-      if (!operation.newContent) {
-        throw new Error('Insert operation requires newContent');
-      }
-      modifiedLines.splice(
-        operation.startLine - 1,
-        0,
-        ...operation.newContent.split('\n')
-      );
-      break;
-
-    case 'deleteLines':
-      if (operation.endLine === undefined) {
-        throw new Error('Delete operation requires endLine');
-      }
-      modifiedLines.splice(
-        operation.startLine - 1,
-        operation.endLine - operation.startLine + 1
-      );
-      break;
+      case 'deleteLines':
+        if (operation.endLine === undefined) {
+          throw new Error('Delete operation requires endLine');
+        }
+        modifiedLines.splice(
+          operation.startLine - 1,
+          operation.endLine - operation.startLine + 1
+        );
+        break;
+    }
   }
 
-  return modifiedLines.join('\n');
+  // Create final content
+  const result = modifiedLines.join('\n');
+
+  // Only validate the complete file if it's a code file
+  if (filePath.endsWith('.ts') || filePath.endsWith('.js')) {
+    try {
+      validateCodeStructure(result);
+    } catch (error) {
+      throw new Error(`Final code structure validation failed: ${error.message}`);
+    }
+  }
+
+  return result;
 }
 
 // Utility functions for position handling
@@ -428,32 +436,60 @@ async function searchFiles(
   return results;
 }
 
-async function performFileUpdate(filePath: string, operations: z.infer<typeof UpdateOperationSchema>[]): Promise<string> {
-  const { content } = await getFilePositions(filePath);
+async function performCharBasedUpdate(filePath: string, operations: z.infer<typeof CharOperationSchema>[]): Promise<string> {
+  const { content, lineStarts } = await getFilePositions(filePath);
   let result = content;
   const fileLength = content.length;
 
   // Sort operations by startPosition in descending order
-  const sortedOps = [...operations].sort((a, b) => (b.startPosition ?? 0) - (a.startPosition ?? 0));
+  const sortedOps = [...operations].sort((a, b) => b.startPosition - a.startPosition);
+  
+  // Keep track of accumulated position shifts
+  let accumulatedShift = 0;
 
   for (const op of sortedOps) {
-    const { startPosition, endPosition, operation, newContent } = op;
-    validatePositions(startPosition, endPosition, fileLength);
-
+    const { startPosition, endPosition = startPosition, operation, newContent = '' } = op;
+    
+    // Adjust positions based on previous operations
+    const adjustedStart = startPosition + accumulatedShift;
+    const adjustedEnd = endPosition + accumulatedShift;
+    
     try {
-      const newResult = result.substring(0, startPosition) + 
-        (operation === 'delete' ? '' : newContent) + 
-        result.substring(operation === 'insert' ? startPosition : (endPosition ?? startPosition));
+      validatePositions(adjustedStart, adjustedEnd, result.length);
 
-      // Validate code structure isn't broken
+      const newResult = result.substring(0, adjustedStart) + 
+        (operation === 'delete' ? '' : newContent) + 
+        result.substring(operation === 'insert' ? adjustedStart : adjustedEnd);
+
+      // Update accumulated shift based on this operation
+      const oldLength = adjustedEnd - adjustedStart;
+      const newLength = operation === 'delete' ? 0 : newContent.length;
+      accumulatedShift += newLength - oldLength;
+
+      // If this is a code file, validate structure
       if (filePath.endsWith('.ts') || filePath.endsWith('.js')) {
-        validateCodeStructure(newResult);
+        try {
+          validateCodeStructure(newResult);
+        } catch (error) {
+          const pos = getLineColumnFromOffset(lineStarts, adjustedStart);
+          const contextLine = result.split('\n')[pos.line - 1];
+          throw new Error(
+            `Code structure validation failed at line ${pos.line}:\n` +
+            `${contextLine}\n` +
+            `${' '.repeat(pos.column - 1)}^ ${error.message}`
+          );
+        }
       }
 
       result = newResult;
     } catch (error) {
-      const pos = getLineColumnFromOffset(result.split('\n'), startPosition);
-      throw new Error(`Operation failed at line ${pos.line}, column ${pos.column}: ${error.message}`);
+      const pos = getLineColumnFromOffset(lineStarts, adjustedStart);
+      const contextLine = result.split('\n')[pos.line - 1];
+      throw new Error(
+        `Operation failed at line ${pos.line}, column ${pos.column}:\n` +
+        `${contextLine}\n` +
+        `${' '.repeat(pos.column - 1)}^ ${error.message}`
+      );
     }
   }
 
@@ -529,13 +565,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: zodToJsonSchema(SearchFilesArgsSchema) as ToolInput,
       },
       {
-        name: "modify_file",
+        name: "modify_chars",
         description:
           "Update specific portions of a file with new content. Supports inserting, " +
           "replacing, or deleting content at specific positions. Each operation specifies " +
           "the position and content to modify. Operations are applied in order from last " +
           "to first position to maintain integrity. Only works within allowed directories.",
-        inputSchema: zodToJsonSchema(UpdateFileArgsSchema) as ToolInput,
+        inputSchema: zodToJsonSchema(ModifyCharsArgsSchema) as ToolInput,
+      },
+      {
+        name: "modify_lines",
+        description:
+          "Update files using line-based operations. Perfect for code modifications, " +
+          "supporting insert, replace, and delete operations by line number. Each operation " +
+          "specifies line numbers and content to modify. Validates code structure and maintains " +
+          "proper formatting. Only works within allowed directories.",
+        inputSchema: zodToJsonSchema(ModifyLinesArgsSchema) as ToolInput,
       },
       {
         name: "get_file_info",
@@ -665,13 +710,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case "modify_file": {
-        const parsed = UpdateFileArgsSchema.safeParse(args);
+      case "modify_chars": {
+        const parsed = ModifyCharsArgsSchema.safeParse(args);
         if (!parsed.success) {
           throw new Error(`Invalid arguments for modify_file: ${parsed.error}`);
         }
         const validPath = await validatePath(parsed.data.path);
-        const newContent = await performFileUpdate(validPath, parsed.data.operations);
+        const newContent = await performCharBasedUpdate(validPath, parsed.data.operations);
+        await fs.writeFile(validPath, newContent, "utf-8");
+        return {
+          content: [{ type: "text", text: `Successfully updated ${parsed.data.path}` }],
+        };
+      }
+
+      case "modify_lines": {
+        const parsed = ModifyLinesArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for modify_lines: ${parsed.error}`);
+        }
+        const validPath = await validatePath(parsed.data.path);
+        
+        // Handle each line operation
+        let newContent = "";
+        for (const operation of parsed.data.operations) {
+          newContent = await performLineBasedUpdate(validPath, operation);
+        }
+        
+        // If this is a code file, validate structure
+        if (validPath.endsWith('.ts') || validPath.endsWith('.js') || 
+            validPath.endsWith('.py') || validPath.endsWith('.json')) {
+          validateCodeStructure(newContent);
+        }
+        
         await fs.writeFile(validPath, newContent, "utf-8");
         return {
           content: [{ type: "text", text: `Successfully updated ${parsed.data.path}` }],
