@@ -12,6 +12,9 @@ import path from "path";
 import os from 'os';
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { spawn } from 'child_process';
+import { join } from 'path';
+import { fileURLToPath } from 'url';
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -141,8 +144,12 @@ const CharOperationSchema = z.object({
 
 const LineOperationSchema = z.object({
   type: z.enum(['replaceLines', 'insertLines', 'deleteLines']),
-  startLine: z.number().positive(),
-  endLine: z.number().positive().optional(),
+  startLine: z.number().positive({
+    message: "Line numbers must be positive integers"
+  }),
+  endLine: z.number().positive({
+    message: "Line numbers must be positive integers"
+  }).optional(),
   newContent: z.string().optional(),
 }).refine((data) => {
   if (data.type === 'deleteLines') {
@@ -156,7 +163,14 @@ const LineOperationSchema = z.object({
   }
   return false;
 }, {
-  message: "Invalid line operation parameters"
+  message: "Invalid operation parameters"
+}).refine((data) => {
+  if (data.endLine && data.endLine < data.startLine) {
+    return false;
+  }
+  return true;
+}, {
+  message: "endLine must be greater than or equal to startLine"
 });
 
 const ModifyLinesArgsSchema = z.object({
@@ -176,6 +190,53 @@ const SearchFilesArgsSchema = z.object({
 
 const GetFileInfoArgsSchema = z.object({
   path: z.string(),
+});
+
+const GetPythonBlocksArgsSchema = z.object({
+  path: z.string(),
+});
+
+const ModifyPythonOperationSchema = z.object({
+  type: z.enum([
+    // Existing operations
+    'add_method',
+    'update_method_body', 
+    'add_imports',
+    'add_parameter',
+    
+    // New operations
+    'fix_indentation',
+    'add_class',
+    'remove_class',
+    'update_class',
+    'move_method',
+    'move_code'
+  ]),
+  target: z.string().optional(),  // Class/method name
+  after: z.string().optional(),   // Insert after this element
+  content: z.string().optional(), // New code content
+  imports: z.array(z.string()).optional(),
+  parameter: z.object({
+    name: z.string(),
+    type: z.string().optional(),
+    default: z.string().optional()
+  }).optional(),
+  // New parameters for move operations
+  source_file: z.string().optional(),
+  target_file: z.string().optional(),
+  source_class: z.string().optional(),
+  target_class: z.string().optional(),
+  start_line: z.number().optional(),
+  end_line: z.number().optional(),
+  target_line: z.number().optional(),
+  move_imports: z.boolean().optional(),
+  // Formatting options
+  spaces_per_indent: z.number().optional()
+});
+
+const ModifyPythonArgsSchema = z.object({
+  path: z.string(),
+  operation: ModifyPythonOperationSchema
 });
 
 const ToolInputSchema = ToolSchema.shape.inputSchema;
@@ -203,6 +264,23 @@ interface FilePosition extends Position {
 interface LineRange {
   startLine: number;
   endLine?: number;
+}
+
+interface PythonBlock {
+  type: 'function' | 'class' | 'method' | 'control_block' | 'docstring';
+  name?: string;
+  start_line: number;
+  end_line: number;
+  indentation: number;
+  parent?: string;
+  children: PythonBlock[];
+}
+
+interface BlockAnalysisResult {
+  blocks: PythonBlock[];
+  find_by_name: (name: string) => PythonBlock | undefined;
+  find_by_type: (type: PythonBlock['type']) => PythonBlock[];
+  find_in_class: (className: string, methodName: string) => PythonBlock | undefined;
 }
 
 // Add these utility functions
@@ -267,40 +345,61 @@ async function performLineBasedUpdate(filePath: string, operations: LineOperatio
   const { content, lines } = await getFilePositions(filePath);
   const modifiedLines = [...lines];
   
+  // Validation block
+  for (const operation of operations) {
+    if (operation.startLine > lines.length) {
+      throw new Error(`Invalid line number: startLine ${operation.startLine} is beyond end of file (${lines.length} lines)`);
+    }
+    if (operation.endLine && operation.endLine > lines.length) {
+      throw new Error(`Invalid line number: endLine ${operation.endLine} is beyond end of file (${lines.length} lines)`);
+    }
+    if (operation.endLine && operation.endLine < operation.startLine) {
+      throw new Error(`Invalid line numbers: endLine (${operation.endLine}) must be greater than or equal to startLine (${operation.startLine})`);
+    }
+  }
+  
   // Apply all operations without validation
   for (const operation of operations) {
     switch (operation.type) {
-      case 'replaceLines':
+      case 'replaceLines': {
         if (!operation.newContent || operation.endLine === undefined) {
           throw new Error('Replace operation requires newContent and endLine');
         }
+        const deleteCount = Math.min(
+          operation.endLine - operation.startLine + 1,
+          modifiedLines.length - (operation.startLine - 1)
+        );
         modifiedLines.splice(
           operation.startLine - 1,
-          operation.endLine - operation.startLine + 1,
+          deleteCount,
           ...operation.newContent.split('\n')
         );
         break;
-
-      case 'insertLines':
+      }
+    
+      case 'insertLines': {
         if (!operation.newContent) {
           throw new Error('Insert operation requires newContent');
         }
         modifiedLines.splice(
-          operation.startLine - 1,
+          Math.min(operation.startLine - 1, modifiedLines.length),
           0,
           ...operation.newContent.split('\n')
         );
         break;
-
-      case 'deleteLines':
+      }
+    
+      case 'deleteLines': {
         if (operation.endLine === undefined) {
           throw new Error('Delete operation requires endLine');
         }
-        modifiedLines.splice(
-          operation.startLine - 1,
-          operation.endLine - operation.startLine + 1
+        const deleteCount = Math.min(
+          operation.endLine - operation.startLine + 1,
+          modifiedLines.length - (operation.startLine - 1)
         );
+        modifiedLines.splice(operation.startLine - 1, deleteCount);
         break;
+      }
     }
   }
 
@@ -311,12 +410,106 @@ async function performLineBasedUpdate(filePath: string, operations: LineOperatio
   if (filePath.endsWith('.ts') || filePath.endsWith('.js')) {
     try {
       validateCodeStructure(result);
-    } catch (error) {
-      throw new Error(`Final code structure validation failed: ${error.message}`);
+    } catch (error: unknown) {
+      throw new Error(`Final code structure validation failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   return result;
+}
+
+async function analyzePythonStructure(filePath: string): Promise<BlockAnalysisResult> {
+  const content = await fs.readFile(filePath, 'utf-8');
+  const lines = content.split('\n');
+  const blocks: PythonBlock[] = [];
+  const stack: PythonBlock[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trimLeft();
+    const indentation = line.length - trimmed.length;
+
+    // Close any blocks that have ended based on indentation
+    while (stack.length > 0 && stack[stack.length - 1].indentation >= indentation) {
+      const block = stack.pop();
+      if (block) {
+        block.end_line = i;
+        blocks.push(block);
+      }
+    }
+
+    // Check for new block starts
+    if (trimmed.startsWith('def ')) {
+      const name = trimmed.slice(4, trimmed.indexOf('(')).trim();
+      const block: PythonBlock = {
+        type: stack.length > 0 && stack[stack.length - 1].type === 'class' ? 'method' : 'function',
+        name,
+        start_line: i + 1,
+        end_line: -1,
+        indentation,
+        children: [],
+        parent: stack.length > 0 ? stack[stack.length - 1].name : undefined
+      };
+      stack.push(block);
+    } 
+    else if (trimmed.startsWith('class ')) {
+      const name = trimmed.slice(6, trimmed.indexOf(':')).trim();
+      const block: PythonBlock = {
+        type: 'class',
+        name,
+        start_line: i + 1,
+        end_line: -1,
+        indentation,
+        children: [],
+        parent: stack.length > 0 ? stack[stack.length - 1].name : undefined
+      };
+      stack.push(block);
+    }
+    else if (trimmed.startsWith('"""') || trimmed.startsWith("'''")) {
+      const block: PythonBlock = {
+        type: 'docstring',
+        start_line: i + 1,
+        end_line: -1,
+        indentation,
+        children: [],
+        parent: stack.length > 0 ? stack[stack.length - 1].name : undefined
+      };
+      stack.push(block);
+    }
+    else if (trimmed.startsWith('if ') || trimmed.startsWith('try:') || 
+             trimmed.startsWith('else:') || trimmed.startsWith('except ')) {
+      const block: PythonBlock = {
+        type: 'control_block',
+        name: trimmed.split(':')[0],
+        start_line: i + 1,
+        end_line: -1,
+        indentation,
+        children: [],
+        parent: stack.length > 0 ? stack[stack.length - 1].name : undefined
+      };
+      stack.push(block);
+    }
+  }
+
+  // Close any remaining blocks
+  while (stack.length > 0) {
+    const block = stack.pop();
+    if (block) {
+      block.end_line = lines.length;
+      blocks.push(block);
+    }
+  }
+
+  return {
+    blocks,
+    find_by_name: (name: string) => blocks.find(b => b.name === name),
+    find_by_type: (type: PythonBlock['type']) => blocks.filter(b => b.type === type),
+    find_in_class: (className: string, methodName: string) => {
+      const classBlock = blocks.find(b => b.type === 'class' && b.name === className);
+      if (!classBlock) return undefined;
+      return blocks.find(b => b.type === 'method' && b.name === methodName && b.parent === className);
+    }
+  };
 }
 
 // Utility functions for position handling
@@ -470,30 +663,51 @@ async function performCharBasedUpdate(filePath: string, operations: z.infer<type
       if (filePath.endsWith('.ts') || filePath.endsWith('.js')) {
         try {
           validateCodeStructure(newResult);
-        } catch (error) {
+        } catch (error: unknown) {
           const pos = getLineColumnFromOffset(lineStarts, adjustedStart);
           const contextLine = result.split('\n')[pos.line - 1];
           throw new Error(
             `Code structure validation failed at line ${pos.line}:\n` +
             `${contextLine}\n` +
-            `${' '.repeat(pos.column - 1)}^ ${error.message}`
+            `${' '.repeat(pos.column - 1)}^ ${error instanceof Error ? error.message : String(error)}`
           );
         }
       }
 
       result = newResult;
-    } catch (error) {
+    } catch (error: unknown) {
       const pos = getLineColumnFromOffset(lineStarts, adjustedStart);
       const contextLine = result.split('\n')[pos.line - 1];
       throw new Error(
         `Operation failed at line ${pos.line}, column ${pos.column}:\n` +
         `${contextLine}\n` +
-        `${' '.repeat(pos.column - 1)}^ ${error.message}`
+        `${' '.repeat(pos.column - 1)}^ ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
 
   return result;
+}
+
+async function runPythonHelper(scriptName: string, args: any): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const scriptPath = join(fileURLToPath(new URL('.', import.meta.url)), 'python_helpers', scriptName);
+    const process = spawn('python3', [scriptPath, JSON.stringify(args)]);
+    
+    let stderr = '';
+
+    process.stderr.on('data', (data) => {
+      stderr += data;
+    });
+
+    process.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Python script failed: ${stderr}`));
+      } else {
+        resolve();
+      }
+    });
+  });
 }
 
 // Tool handlers
@@ -574,13 +788,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: zodToJsonSchema(ModifyCharsArgsSchema) as ToolInput,
       },
       {
-        name: "modify_lines",
+        name: "modify_text",
         description:
           "Update files using line-based operations. Perfect for code modifications, " +
           "supporting insert, replace, and delete operations by line number. Each operation " +
           "specifies line numbers and content to modify. Validates code structure and maintains " +
           "proper formatting. Only works within allowed directories.",
         inputSchema: zodToJsonSchema(ModifyLinesArgsSchema) as ToolInput,
+      },
+      {
+        name: "modify_python",
+        description: 
+          "High-level tool for modifying Python code, supporting operations like " +
+          "adding methods, updating method bodies, managing imports, and handling parameters. " +
+          "Automatically handles indentation and code formatting.",
+        inputSchema: zodToJsonSchema(ModifyPythonArgsSchema) as ToolInput,
       },
       {
         name: "get_file_info",
@@ -723,18 +945,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case "modify_lines": {
+      case "modify_text": {
         const parsed = ModifyLinesArgsSchema.safeParse(args);
         if (!parsed.success) {
-          throw new Error(`Invalid arguments for modify_lines: ${parsed.error}`);
+          throw new Error(`Invalid arguments for modify_text: ${parsed.error}`);
         }
         const validPath = await validatePath(parsed.data.path);
         
-        // Handle each line operation
-        let newContent = "";
-        for (const operation of parsed.data.operations) {
-          newContent = await performLineBasedUpdate(validPath, operation);
-        }
+      const newContent = await performLineBasedUpdate(validPath, parsed.data.operations);
         
         // If this is a code file, validate structure
         if (validPath.endsWith('.ts') || validPath.endsWith('.js') || 
@@ -743,6 +961,138 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         
         await fs.writeFile(validPath, newContent, "utf-8");
+        return {
+          content: [{ type: "text", text: `Successfully updated ${parsed.data.path}` }],
+        };
+      }
+
+      case "modify_python": {
+        const parsed = ModifyPythonArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for modify_python: ${parsed.error}`);
+        }
+      
+        const validPath = await validatePath(parsed.data.path);
+        const operation = parsed.data.operation;
+      
+        switch (operation.type) {
+          case 'add_method':
+            await runPythonHelper('add_method.py', {
+              file_path: validPath,
+              class_name: operation.target,
+              method_content: operation.content,
+              after_method: operation.after
+            });
+            break;
+            
+            case 'update_method_body':
+              await runPythonHelper('update_method.py', {
+                file_path: validPath,
+                method_name: operation.target,
+                new_body: operation.content
+              });
+              break;
+            
+            case 'add_imports':
+              if (!operation.imports) {
+                throw new Error('add_imports requires imports array');
+              }
+              await runPythonHelper('add_import.py', {
+                file_path: validPath,
+                imports: operation.imports
+              });
+              break;
+            
+            case 'add_parameter':
+              if (!operation.parameter) {
+                throw new Error('add_parameter requires parameter object');
+              }
+              await runPythonHelper('add_parameter.py', {
+                file_path: validPath,
+                method_name: operation.target,
+                param_name: operation.parameter.name,
+                param_type: operation.parameter.type,
+                default_value: operation.parameter.default
+              });
+              break;
+            
+              case 'fix_indentation': {
+                await runPythonHelper('fix_indentation.py', {
+                  file_path: validPath,
+                  spaces_per_indent: operation.spaces_per_indent || 4
+                });
+                break;
+              }
+              
+              case 'add_class': {
+                if (!operation.content) {
+                  throw new Error('add_class requires class definition content');
+                }
+                await runPythonHelper('add_class.py', {
+                  file_path: validPath,
+                  class_def: operation.content,
+                  after_class: operation.after
+                });
+                break;
+              }
+              
+              case 'remove_class': {
+                if (!operation.target) {
+                  throw new Error('remove_class requires target class name');
+                }
+                await runPythonHelper('remove_class.py', {
+                  file_path: validPath,
+                  class_name: operation.target
+                });
+                break;
+              }
+              
+              case 'update_class': {
+                if (!operation.target || !operation.content) {
+                  throw new Error('update_class requires target class and new definition');
+                }
+                await runPythonHelper('update_class.py', {
+                  file_path: validPath,
+                  class_name: operation.target,
+                  new_class_def: operation.content
+                });
+                break;
+              }
+              
+              case 'move_method': {
+                if (!operation.target || !operation.source_class || !operation.target_class) {
+                  throw new Error('move_method requires method name, source class, and target class');
+                }
+                await runPythonHelper('move_method.py', {
+                  source_file: operation.source_file || validPath,
+                  target_file: operation.target_file || validPath,
+                  method_name: operation.target,
+                  source_class: operation.source_class,
+                  target_class: operation.target_class
+                });
+                break;
+              }
+              
+              case 'move_code': {
+                if (!operation.start_line || !operation.end_line || !operation.target_line) {
+                  throw new Error('move_code requires start_line, end_line, and target_line');
+                }
+                await runPythonHelper('move_code.py', {
+                  source_file: operation.source_file || validPath,
+                  target_file: operation.target_file || validPath,
+                  start_line: operation.start_line,
+                  end_line: operation.end_line,
+                  target_line: operation.target_line,
+                  move_imports: operation.move_imports !== false  // Default to true
+                });
+                break;
+              }
+
+          // We'll add other cases as we add more Python helpers
+          default:
+            throw new Error(`Python operation type ${operation.type} not yet implemented`);
+        }
+      
         return {
           content: [{ type: "text", text: `Successfully updated ${parsed.data.path}` }],
         };
